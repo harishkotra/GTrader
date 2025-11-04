@@ -1,6 +1,10 @@
-# Trading Bot Documentation
+# GTrader
 
 This is a sophisticated cryptocurrency trading bot that interfaces with the Hyperliquid exchange. The bot implements various trading strategies using technical analysis and AI-driven decision making.
+
+#2 on [Recall Agents vs Alpha Arena Models](https://app.recall.network/competitions/51cee080-b5de-445d-a532-d1d474a67a30)
+
+<img width="970" height="717" alt="image" src="https://github.com/user-attachments/assets/44fb754f-9984-4090-ae88-f7298e5850a0" />
 
 ## Components Overview
 
