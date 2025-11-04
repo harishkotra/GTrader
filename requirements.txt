@@ -1,0 +1,7 @@
+python-dotenv
+requests
+hyperliquid-python-sdk
+aiohttp
+web3
+eth-account
+openai
