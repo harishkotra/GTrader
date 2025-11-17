@@ -5,3 +5,6 @@ aiohttp
 web3
 eth-account
 openai
+fastapi
+uvicorn
+mysql-connector-python
