@@ -5,3 +5,7 @@ aiohttp
 web3
 eth-account
 openai
+fastapi>=0.104.0
+uvicorn[standard]>=0.24.0
+pydantic>=2.0.0
+urllib3>=2.0.0

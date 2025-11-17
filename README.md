@@ -120,5 +120,111 @@ async def analyze_market_conditions(self, prices_24h: dict) -> dict
 - `MNEMONIC`: Alternative to private key for authentication
 - `GAIA_API_KEY`: API key for AI decision making
 - `GAIA_NODE_URL`: URL for AI service
+- `MYRIAD_API_KEY`: API key for Myriad Protocol API V2 access
+- `MYRIAD_API_URL`: Base URL for Myriad Protocol API (default: production)
 - `ASSETS`: Comma-separated list of assets to trade
 - `INTERVAL`: Trading interval (e.g., "15m")
+
+## GTrader REST API
+
+GTrader now includes a REST API built with FastAPI that provides endpoints to monitor trading decisions, positions, and integrates with the Myriad Protocol API V2 for prediction markets.
+
+### Starting the API Server
+
+```bash
+# Install dependencies
+pip install -r requirements.txt
+
+# Run the API server
+uvicorn api:app --host 0.0.0.0 --port 8000
+
+# Or run with auto-reload for development
+uvicorn api:app --reload
+```
+
+The API will be available at `http://localhost:8000`
+
+API Documentation (Swagger UI): `http://localhost:8000/docs`
+
+### GTrader API Endpoints
+
+#### Health & Status
+- `GET /health` - Health check
+- `GET /account` - Get account information
+- `GET /config` - Get current configuration
+- `PUT /config` - Update configuration
+
+#### Trading Data
+- `GET /positions` - Get current open positions
+- `GET /decisions` - Get recent trading decisions
+- `GET /market-analysis` - Get market analysis for tracked assets
+- `GET /trades` - Get trade history
+- `GET /performance` - Get performance metrics and statistics
+
+#### Query Parameters
+Most list endpoints support pagination and filtering:
+- `limit`: Number of results to return (default: 20)
+- `asset`: Filter by specific asset (e.g., BTC, ETH)
+- `status`: Filter by status
+
+### Myriad Protocol API V2 Integration
+
+GTrader integrates with [Myriad Protocol](https://myriadprotocol.com/), a decentralized prediction markets platform. See `MYRIAD_API_V2.md` for complete API documentation.
+
+#### Myriad API Endpoints
+
+**Markets**
+- `GET /myriad/markets` - Get prediction markets
+- `GET /myriad/markets/{market_id}` - Get specific market details
+- `POST /myriad/quote` - Get trade quote for a market outcome
+
+**User Portfolio**
+- `GET /myriad/user/{address}/portfolio` - Get user's positions across markets
+
+#### Example: Get Open Markets on Abstract
+
+```bash
+curl -X GET "http://localhost:8000/myriad/markets?network_id=2741&state=open&limit=10"
+```
+
+#### Example: Get Market Quote
+
+```bash
+curl -X POST "http://localhost:8000/myriad/quote" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "market_id": 164,
+    "network_id": 2741,
+    "outcome_id": 0,
+    "action": "buy",
+    "value": 100,
+    "slippage": 0.01
+  }'
+```
+
+### Supported Networks
+
+Myriad Protocol is available on:
+- **Abstract** (Network ID: 2741)
+- **Linea** (Network ID: 59144)
+- **BNB Chain** (Network ID: 56)
+- **Celo** (Coming soon)
+
+See `MYRIAD_API_V2.md` for complete contract addresses and network details.
+
+## Installation
+
+1. Clone the repository
+2. Install dependencies: `pip install -r requirements.txt`
+3. Copy `.env.example` to `.env` and fill in your configuration
+4. Run the trading bot: `python agent.py`
+5. (Optional) Run the API server: `uvicorn api:app --host 0.0.0.0 --port 8000`
+
+## Architecture
+
+The system now consists of two main components:
+
+1. **Trading Bot** (`agent.py`) - Core trading logic that runs continuously
+2. **REST API** (`api.py`) - HTTP API for monitoring and Myriad Protocol integration
+
+The API can run alongside the trading bot or independently for accessing Myriad Protocol data.
