@@ -9,6 +9,8 @@ from datetime import datetime, timezone
 import math
 import decimal
 import requests
+from typing import Optional, List, Dict
+from contextlib import asynccontextmanager
 
 import aiohttp
 from dotenv import load_dotenv
@@ -17,6 +19,11 @@ from hyperliquid.exchange import Exchange
 from hyperliquid.info import Info
 from hyperliquid.utils import constants
 from openai import OpenAI
+from fastapi import FastAPI, HTTPException, Query
+from fastapi.middleware.cors import CORSMiddleware
+import uvicorn
+import mysql.connector
+from mysql.connector import Error as MySQLError
 
 # --- 1. Configuration & Logging ---
 load_dotenv()
@@ -36,6 +43,15 @@ CONFIG = {
     "gaia_model_name": _get_env("GAIA_MODEL_NAME", "x-ai/grok-4"),
     "assets": _get_env("ASSETS", "BTC,ETH,SOL,XRP,DOGE,BNB"),
     "interval": _get_env("INTERVAL", "15m"),
+    # Database config
+    "db_host": _get_env("DB_HOST", required=True),
+    "db_user": _get_env("DB_USER", required=True),
+    "db_password": _get_env("DB_PASSWORD", required=True),
+    "db_name": _get_env("DB_NAME", required=True),
+    "db_port": int(_get_env("DB_PORT", "3306")),
+    # API config
+    "api_host": _get_env("API_HOST", "0.0.0.0"),
+    "api_port": int(_get_env("API_PORT", "8000")),
 }
 
 # OPTIMIZED Parameters for consistent sizing
@@ -57,7 +73,230 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-# --- 2. Trade Manager for Consistent Sizing ---
+# --- 2. MySQL Database Manager ---
+class DatabaseManager:
+    def __init__(self, skip_init=False):
+        self.connection = None
+        self.db_available = False
+        self.last_error = None
+        
+        if not skip_init:
+            try:
+                self.test_connection()
+                self.initialize_db()
+                self.db_available = True
+                logger.info("✅ Database connection successful")
+            except Exception as e:
+                self.last_error = str(e)
+                logger.warning(f"⚠️  Database initialization failed: {e}")
+                logger.warning("⚠️  API will work in read-only mode. Decisions will not be persisted.")
+                self.db_available = False
+    
+    def test_connection(self):
+        """Test database connection"""
+        try:
+            conn = mysql.connector.connect(
+                host=CONFIG["db_host"],
+                port=CONFIG["db_port"],
+                user=CONFIG["db_user"],
+                password=CONFIG["db_password"],
+                database=CONFIG["db_name"],
+                connection_timeout=10
+            )
+            conn.close()
+            logger.info(f"✅ Database connection test passed: {CONFIG['db_host']}:{CONFIG['db_port']}")
+        except MySQLError as e:
+            logger.error(f"❌ Database connection test failed")
+            logger.error(f"   Host: {CONFIG['db_host']}:{CONFIG['db_port']}")
+            logger.error(f"   User: {CONFIG['db_user']}")
+            logger.error(f"   Error: {e}")
+            raise
+    
+    def get_connection(self):
+        try:
+            if self.connection is None or not self.connection.is_connected():
+                self.connection = mysql.connector.connect(
+                    host=CONFIG["db_host"],
+                    port=CONFIG["db_port"],
+                    user=CONFIG["db_user"],
+                    password=CONFIG["db_password"],
+                    database=CONFIG["db_name"],
+                    connection_timeout=10
+                )
+            return self.connection
+        except MySQLError as e:
+            logger.error(f"Database connection error: {e}")
+            self.db_available = False
+            raise
+    
+    def initialize_db(self):
+        """Create tables if they don't exist"""
+        try:
+            conn = self.get_connection()
+            cursor = conn.cursor()
+            
+            # Create decisions table
+            create_table_sql = """
+            CREATE TABLE IF NOT EXISTS trade_decisions (
+                id INT AUTO_INCREMENT PRIMARY KEY,
+                timestamp DATETIME DEFAULT CURRENT_TIMESTAMP,
+                token VARCHAR(50) NOT NULL,
+                action VARCHAR(20) NOT NULL,
+                conviction VARCHAR(20),
+                size DECIMAL(20, 8),
+                reason TEXT,
+                account_value DECIMAL(20, 2),
+                pnl_percentage DECIMAL(10, 4),
+                daily_trade_count INT,
+                consecutive_losses INT,
+                INDEX idx_timestamp (timestamp),
+                INDEX idx_token (token),
+                INDEX idx_action (action)
+            ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
+            """
+            
+            cursor.execute(create_table_sql)
+            conn.commit()
+            logger.info("✅ Database tables verified/created")
+            cursor.close()
+        except MySQLError as e:
+            logger.error(f"Error initializing database: {e}")
+            raise
+    
+    def store_decision(self, decision_data: Dict):
+        """Store a single trade decision to the database"""
+        if not self.db_available:
+            logger.warning(f"Database unavailable - decision for {decision_data.get('token')} not stored")
+            return None
+            
+        try:
+            conn = self.get_connection()
+            cursor = conn.cursor()
+            
+            insert_sql = """
+            INSERT INTO trade_decisions 
+            (token, action, conviction, size, reason, account_value, pnl_percentage, daily_trade_count, consecutive_losses)
+            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
+            """
+            
+            cursor.execute(insert_sql, (
+                decision_data.get("token"),
+                decision_data.get("action"),
+                decision_data.get("conviction"),
+                decision_data.get("size"),
+                decision_data.get("reason"),
+                decision_data.get("account_value"),
+                decision_data.get("pnl_percentage"),
+                decision_data.get("daily_trade_count"),
+                decision_data.get("consecutive_losses")
+            ))
+            
+            conn.commit()
+            cursor.close()
+            logger.debug(f"Decision stored for {decision_data.get('token')}")
+            return cursor.lastrowid
+        except MySQLError as e:
+            logger.error(f"Error storing decision: {e}")
+            self.db_available = False
+            return None
+    
+    def get_decisions(self, token: Optional[str] = None, action: Optional[str] = None, 
+                     limit: int = 100, offset: int = 0) -> List[Dict]:
+        """Retrieve decisions from database with optional filters"""
+        if not self.db_available:
+            logger.warning("Database unavailable - returning empty results")
+            return []
+            
+        try:
+            conn = self.get_connection()
+            cursor = conn.cursor(dictionary=True)
+            
+            query = "SELECT * FROM trade_decisions WHERE 1=1"
+            params = []
+            
+            if token:
+                query += " AND token = %s"
+                params.append(token)
+            
+            if action:
+                query += " AND action = %s"
+                params.append(action)
+            
+            query += " ORDER BY timestamp DESC LIMIT %s OFFSET %s"
+            params.extend([limit, offset])
+            
+            cursor.execute(query, params)
+            results = cursor.fetchall()
+            cursor.close()
+            return results
+        except MySQLError as e:
+            logger.error(f"Error retrieving decisions: {e}")
+            self.db_available = False
+            return []
+    
+    def get_decision_stats(self, token: Optional[str] = None) -> Dict:
+        """Get statistics about stored decisions"""
+        if not self.db_available:
+            logger.warning("Database unavailable - returning empty stats")
+            return {"total_decisions": 0, "by_action": {}, "average_conviction_score": 0}
+            
+        try:
+            conn = self.get_connection()
+            cursor = conn.cursor(dictionary=True)
+            
+            # Total decisions
+            query = "SELECT COUNT(*) as total FROM trade_decisions WHERE 1=1"
+            params = []
+            
+            if token:
+                query += " AND token = %s"
+                params.append(token)
+            
+            cursor.execute(query, params)
+            total = cursor.fetchone()["total"]
+            
+            # Count by action
+            query = "SELECT action, COUNT(*) as count FROM trade_decisions WHERE 1=1"
+            params = []
+            
+            if token:
+                query += " AND token = %s"
+                params.append(token)
+            
+            query += " GROUP BY action"
+            cursor.execute(query, params)
+            action_counts = {row["action"]: row["count"] for row in cursor.fetchall()}
+            
+            # Average conviction
+            query = "SELECT AVG(CAST(CASE WHEN conviction='HIGH' THEN 3 WHEN conviction='MEDIUM' THEN 2 ELSE 1 END AS DECIMAL)) as avg_conviction FROM trade_decisions WHERE 1=1"
+            params = []
+            
+            if token:
+                query += " AND token = %s"
+                params.append(token)
+            
+            cursor.execute(query, params)
+            avg_conv = cursor.fetchone()["avg_conviction"] or 0
+            
+            cursor.close()
+            
+            return {
+                "total_decisions": total,
+                "by_action": action_counts,
+                "average_conviction_score": float(avg_conv)
+            }
+        except MySQLError as e:
+            logger.error(f"Error retrieving stats: {e}")
+            self.db_available = False
+            return {"total_decisions": 0, "by_action": {}, "average_conviction_score": 0}
+    
+    def close(self):
+        """Close database connection"""
+        if self.connection and self.connection.is_connected():
+            self.connection.close()
+            logger.info("Database connection closed")
+
+# --- 3. Trade Manager for Consistent Sizing ---
 class TradeManager:
     def __init__(self):
         self.daily_trade_count = 0
@@ -99,7 +338,7 @@ class TradeManager:
         
         logger.info(f"Trade recorded: success={success}, daily_count={self.daily_trade_count}, consecutive_losses={self.consecutive_losses}")
 
-# --- 3. Smart Position Sizer ---
+# --- 4. Smart Position Sizer ---
 class SmartPositionSizer:
     @staticmethod
     def calculate_optimal_size(account_value: float, current_price: float, conviction: str, 
@@ -121,7 +360,7 @@ class SmartPositionSizer:
         
         return position_size
 
-# --- 4. Technical Indicators Class ---
+# --- 5. Technical Indicators Class ---
 class TechnicalIndicators:
     @staticmethod
     def calculate_rsi(prices, period=14):
@@ -161,7 +400,7 @@ class TechnicalIndicators:
         
         return "HOLD", "LOW", 0.4, f"RSI: {rsi:.1f} - waiting for better setup"
 
-# --- 5. Data Sources ---
+# --- 6. Data Sources ---
 class DataSources:
     COINGECKO_IDS = { 
         "BTC": "bitcoin", "ETH": "ethereum", "SOL": "solana", 
@@ -207,7 +446,7 @@ class DataSources:
             logger.error(f"Failed to fetch historical prices for {coin}: {e}")
             return []
 
-# --- 6. Hyperliquid API Client ---
+# --- 7. Hyperliquid API Client ---
 class HyperliquidAPI:
     def __init__(self):
         if CONFIG["hyperliquid_private_key"]: 
@@ -308,7 +547,7 @@ class HyperliquidAPI:
             logger.error(f"An exception occurred during order placement: {e}")
             return {"status": "error", "message": str(e)}
 
-# --- 7. Enhanced Market Analysis ---
+# --- 8. Enhanced Market Analysis ---
 class EnhancedMarketAnalyzer:
     def __init__(self, data_sources):
         self.data_sources = data_sources
@@ -339,7 +578,7 @@ class EnhancedMarketAnalyzer:
         
         return analysis
 
-# --- 8. Enhanced Trading Agent ---
+# --- 9. Enhanced Trading Agent ---
 class TradingAgent:
     def __init__(self):
         self.client = OpenAI(api_key=CONFIG["gaia_api_key"], base_url=CONFIG["gaia_node_url"])
@@ -405,7 +644,116 @@ Your response MUST be ONLY a valid JSON array. NO MARKDOWN, NO EXPLANATORY TEXT.
             logger.error(f"Error in LLM decision making: {e}")
             return None
 
-# --- 9. Optimized Main Agent ---
+# --- 10. Global Database Instance ---
+db_manager: Optional[DatabaseManager] = None
+
+# --- 11. API Routes with Lifespan Context Manager ---
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    """Lifespan context manager for FastAPI app startup/shutdown"""
+    global db_manager
+    logger.info("✅ API STARTUP: Initializing database manager")
+    db_manager = DatabaseManager(skip_init=False)
+    if db_manager.db_available:
+        logger.info("✅ Database connection established")
+    else:
+        logger.warning("⚠️  Database unavailable - API running in read-only mode")
+    yield
+    logger.info("API SHUTDOWN: Closing database connection")
+    if db_manager:
+        db_manager.close()
+
+app = FastAPI(title="Trading Agent API", version="1.0.0", lifespan=lifespan)
+
+# Add CORS middleware
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+@app.get("/health")
+async def health_check():
+    """Health check endpoint"""
+    db_status = "connected" if db_manager and db_manager.db_available else "disconnected"
+    return {
+        "status": "healthy",
+        "database": db_status,
+        "timestamp": datetime.now().isoformat()
+    }
+
+@app.get("/decisions")
+async def get_decisions(
+    token: Optional[str] = Query(None, description="Filter by token symbol"),
+    action: Optional[str] = Query(None, description="Filter by action (LONG/SHORT/HOLD)"),
+    limit: int = Query(100, ge=1, le=1000, description="Number of results to return"),
+    offset: int = Query(0, ge=0, description="Offset for pagination")
+):
+    """Get trade decisions from database with optional filters"""
+    try:
+        if not db_manager or not db_manager.db_available:
+            raise HTTPException(status_code=503, detail="Database connection unavailable")
+        
+        results = db_manager.get_decisions(token=token, action=action, limit=limit, offset=offset)
+        return {
+            "count": len(results),
+            "limit": limit,
+            "offset": offset,
+            "decisions": results
+        }
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error in GET /decisions: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.get("/decisions/stats")
+async def get_stats(token: Optional[str] = Query(None, description="Filter by token symbol")):
+    """Get statistics about stored decisions"""
+    try:
+        if not db_manager or not db_manager.db_available:
+            raise HTTPException(status_code=503, detail="Database connection unavailable")
+        
+        stats = db_manager.get_decision_stats(token=token)
+        return {
+            "token": token or "all",
+            "stats": stats,
+            "timestamp": datetime.now().isoformat()
+        }
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error in GET /decisions/stats: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.get("/decisions/{token}")
+async def get_token_decisions(
+    token: str,
+    limit: int = Query(100, ge=1, le=1000),
+    offset: int = Query(0, ge=0)
+):
+    """Get all decisions for a specific token"""
+    try:
+        if not db_manager or not db_manager.db_available:
+            raise HTTPException(status_code=503, detail="Database connection unavailable")
+        
+        results = db_manager.get_decisions(token=token.upper(), limit=limit, offset=offset)
+        return {
+            "token": token.upper(),
+            "count": len(results),
+            "limit": limit,
+            "offset": offset,
+            "decisions": results
+        }
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error in GET /decisions/{{token}}: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+# --- 12. Optimized Main Agent ---
 class MainAgent:
     def __init__(self, assets, interval):
         self.assets = assets
@@ -504,6 +852,7 @@ class MainAgent:
         mids = await self.hyperliquid.get_all_mids()
         
         trade_executed = False
+        return_pct = ((account_value - self.initial_account_value) / self.initial_account_value) * 100
 
         for decision in decisions:
             if trade_executed:
@@ -512,11 +861,33 @@ class MainAgent:
             try:
                 action, token = decision.get("action", "").upper(), decision.get("token")
                 conviction = decision.get("conviction", "LOW").upper()
+                reason = decision.get("reason", "No reason provided")
+                size = float(decision.get("size", 0))
+                
                 if not token or token not in self.assets:
                     continue
 
+                # Store decision in database
+                decision_data = {
+                    "token": token,
+                    "action": action,
+                    "conviction": conviction,
+                    "size": size,
+                    "reason": reason,
+                    "account_value": account_value,
+                    "pnl_percentage": return_pct,
+                    "daily_trade_count": self.trade_manager.daily_trade_count,
+                    "consecutive_losses": self.trade_manager.consecutive_losses
+                }
+                
+                try:
+                    if db_manager and db_manager.db_available:
+                        db_manager.store_decision(decision_data)
+                except Exception as e:
+                    logger.warning(f"Failed to store decision for {token}: {e}")
+
                 if action == "HOLD":
-                    logger.info(f"Holding {token} - {decision.get('reason')}")
+                    logger.info(f"Holding {token} - {reason}")
                     continue
 
                 logger.info(f"Processing {action} for {token} (Conviction: {conviction})")
@@ -653,12 +1024,42 @@ class MainAgent:
 
 # --- Main Execution ---
 if __name__ == "__main__":
+    logger.info("="*80)
+    logger.info("STARTING TRADING AGENT WITH API SERVER")
+    logger.info("="*80)
+    
     assets = [asset.strip().upper() for asset in CONFIG["assets"].split(',')]
+    
+    # Start FastAPI server in a separate thread
+    import threading
+    
+    def run_server():
+        logger.info(f"🚀 Starting FastAPI server on {CONFIG['api_host']}:{CONFIG['api_port']}")
+        try:
+            uvicorn.run(
+                app,
+                host=CONFIG["api_host"],
+                port=CONFIG["api_port"],
+                log_level="info"
+            )
+        except Exception as e:
+            logger.error(f"❌ API server error: {e}")
+    
+    server_thread = threading.Thread(target=run_server, daemon=False)
+    server_thread.start()
+    
+    # Give the server a moment to start
+    time.sleep(2)
+    logger.info("✅ API SERVER STARTED - Ready to accept requests")
+    logger.info(f"📊 API endpoints available at http://localhost:{CONFIG['api_port']}")
+    
+    # Start the main trading agent
     agent = MainAgent(assets=assets, interval=CONFIG["interval"])
+    
     try:
         asyncio.run(agent.run())
     except KeyboardInterrupt:
-        logger.info("Optimized Agent shutdown by user.")
+        logger.info("⏹️  Optimized Agent shutdown by user.")
     except Exception as e:
-        logger.critical(f"Optimized Agent stopped: {e}")
+        logger.critical(f"❌ Optimized Agent stopped: {e}")
         sys.exit(1)
